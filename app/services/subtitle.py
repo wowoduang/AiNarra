@@ -4,7 +4,7 @@ import re
 import sys
 import traceback
 import subprocess
-import math
+import json
 from typing import Optional, List, Tuple, Dict, Any
 
 try:
@@ -74,6 +74,32 @@ MODEL_CANDIDATES = {
 
 _MODEL_FILES = ("model.bin", "model.safetensors")
 
+# ---------- subtitle cleaning / normalization ----------
+
+_CONTROL_TAG_GROUP_RE = re.compile(r"(?:<\|[^|]+?\|>\s*)+")
+_CONTROL_TAG_RE = re.compile(r"<\|[^|]+?\|>")
+_ASS_TAG_RE = re.compile(r"\{\\[^{}]*\}")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_MULTI_SPACE_RE = re.compile(r"[ \t\u3000]+")
+_DUP_PUNC_RE = re.compile(r"([，。！？；：,.!?;:])\1{1,}")
+
+_GARBAGE_WORDS_RE = re.compile(
+    r"\b(?:Speech|BGM|EMO_UNKNOWN|NEUTRAL|HAPPY|ANGRY|SAD|FEAR|SURPRISE|DISGUST|withitn|withit|withint)\b",
+    re.IGNORECASE,
+)
+
+_CUE_ONLY_PATTERNS = [
+    r"^\(?\s*(bgm|music|applause|laughter|laughing|sigh|crying|phone ringing|ringtone)\s*\)?$",
+    r"^\(?\s*(音乐|配乐|背景音乐|掌声|笑声|哭声|叹气|铃声|电话铃声|风声|雨声|脚步声|鼓掌)\s*\)?$",
+    r"^\[?\s*(bgm|music|applause|laughter|laughing|sigh|crying)\s*\]?$",
+    r"^\[?\s*(音乐|配乐|背景音乐|掌声|笑声|哭声)\s*\]?$",
+]
+_CUE_ONLY_RE = re.compile("|".join(_CUE_ONLY_PATTERNS), re.IGNORECASE)
+
+_SEGMENT_JSON_SUFFIX = "_segments.json"
+_RAW_SRT_SUFFIX = "_raw.srt"
+_CLEAN_SRT_SUFFIX = "_clean.srt"
+
 
 def _base_dirs() -> List[str]:
     seen: set = set()
@@ -109,6 +135,81 @@ def _normalize_backend() -> str:
 
 
 CURRENT_BACKEND = _normalize_backend()
+
+
+def _derive_debug_paths(subtitle_file: str) -> Tuple[str, str]:
+    root, ext = os.path.splitext(subtitle_file)
+    if not ext:
+        ext = ".srt"
+    return f"{root}{_RAW_SRT_SUFFIX}", f"{root}{_CLEAN_SRT_SUFFIX}"
+
+
+def _derive_segments_json_path(subtitle_file: str) -> str:
+    root, _ = os.path.splitext(subtitle_file)
+    return f"{root}{_SEGMENT_JSON_SUFFIX}"
+
+
+def _clean_subtitle_text(text: str) -> str:
+    text = text or ""
+    text = _CONTROL_TAG_GROUP_RE.sub("\n", text)
+    text = _ASS_TAG_RE.sub("", text)
+    text = _HTML_TAG_RE.sub("", text)
+    text = _CONTROL_TAG_RE.sub("", text)
+    text = _GARBAGE_WORDS_RE.sub("", text)
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[·•]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    text = re.sub(r"\s*([，。！？；：、“”‘’《》、,.!?;:])\s*", r"\1", text)
+    text = _DUP_PUNC_RE.sub(r"\1", text)
+    text = re.sub(r"\(\s*\)", "", text)
+    text = re.sub(r"（\s*）", "", text)
+    text = re.sub(r"\[\s*\]", "", text)
+    return text.strip()
+
+
+def _is_meaningful_subtitle_text(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if _CUE_ONLY_RE.match(stripped):
+        return False
+    if not re.sub(r"[，。！？；：、“”‘’《》、,.!?;:\-\—~…·\s]", "", stripped):
+        return False
+    return True
+
+
+def _extract_clean_sentence_units(text: str) -> List[str]:
+    cleaned = _clean_subtitle_text(text)
+    if not cleaned:
+        return []
+
+    coarse_parts = [p.strip() for p in cleaned.split("\n") if p.strip()]
+    final_parts: List[str] = []
+
+    for part in coarse_parts:
+        if not _is_meaningful_subtitle_text(part):
+            continue
+
+        strong_parts = [seg.strip() for seg in re.split(r"(?<=[。！？!?；;])", part) if seg.strip()]
+        refined: List[str] = []
+
+        for seg in strong_parts:
+            if len(seg) > 42:
+                comma_parts = [x.strip() for x in re.split(r"(?<=[，,])", seg) if x.strip()]
+                refined.extend(comma_parts or [seg])
+            else:
+                refined.append(seg)
+
+        for seg in refined:
+            seg = _clean_subtitle_text(seg)
+            if _is_meaningful_subtitle_text(seg):
+                final_parts.append(seg)
+
+    return final_parts
 
 
 def _is_valid_model_dir(path: str) -> bool:
@@ -378,12 +479,21 @@ def _extract_audio_ffmpeg(video_file: str, audio_file: str) -> bool:
 
 
 def _append_subtitle_line(subtitles: List[Dict[str, Any]], seg_text: str, seg_start: float, seg_end: float):
+    seg_text = _clean_subtitle_text(seg_text or "")
+    if not _is_meaningful_subtitle_text(seg_text):
+        return
+    seg_start = max(0.0, float(seg_start or 0.0))
+    seg_end = max(seg_start, float(seg_end or seg_start))
+    subtitles.append({"msg": seg_text, "start_time": seg_start, "end_time": seg_end})
+
+
+def _append_raw_subtitle_line(raw_subtitles: List[Dict[str, Any]], seg_text: str, seg_start: float, seg_end: float):
     seg_text = (seg_text or "").strip()
     if not seg_text:
         return
     seg_start = max(0.0, float(seg_start or 0.0))
     seg_end = max(seg_start, float(seg_end or seg_start))
-    subtitles.append({"msg": seg_text, "start_time": seg_start, "end_time": seg_end})
+    raw_subtitles.append({"msg": seg_text, "start_time": seg_start, "end_time": seg_end})
 
 
 def _coerce_seconds(value: Any) -> float:
@@ -391,29 +501,36 @@ def _coerce_seconds(value: Any) -> float:
         num = float(value)
     except Exception:
         return 0.0
-    # sentence_info in FunASR usually uses milliseconds.
     return num / 1000.0 if num > 1000 else num
 
 
 def _split_sentences_keep_punctuation(text: str) -> List[str]:
-    text = re.sub(r"\s+", " ", (text or "").strip())
-    if not text:
+    parts = _extract_clean_sentence_units(text)
+    if parts:
+        return parts
+
+    text = _clean_subtitle_text(text)
+    if not _is_meaningful_subtitle_text(text):
         return []
+
     parts = [seg.strip() for seg in re.split(r"(?<=[。！？!?；;])\s*", text) if seg.strip()]
     if len(parts) <= 1:
         parts = [seg.strip() for seg in re.split(r"(?<=[，,])\s*", text) if seg.strip()]
     if len(parts) <= 1:
         parts = utils.split_string_by_punctuations(text)
-    return [seg.strip() for seg in parts if seg.strip()] or ([text] if text else [])
+    return [seg.strip() for seg in parts if _is_meaningful_subtitle_text(seg)] or ([text] if _is_meaningful_subtitle_text(text) else [])
 
 
 def _append_split_subtitle_lines(subtitles: List[Dict[str, Any]], text: str, start: float, end: float) -> int:
-    text = (text or "").strip()
-    if not text:
+    text = _clean_subtitle_text(text or "")
+    if not _is_meaningful_subtitle_text(text):
         return 0
+
     start = max(0.0, float(start or 0.0))
     end = max(start, float(end or start))
     sentences = _split_sentences_keep_punctuation(text)
+    if not sentences:
+        return 0
     if len(sentences) <= 1:
         _append_subtitle_line(subtitles, text, start, end)
         return 1
@@ -458,7 +575,11 @@ def _extract_item_time_range(item: Dict[str, Any]) -> Tuple[float, float]:
     return start, max(start, end)
 
 
-def _parse_funasr_result_item(item: Dict[str, Any], subtitles: List[Dict[str, Any]]) -> int:
+def _parse_funasr_result_item(
+    item: Dict[str, Any],
+    subtitles: List[Dict[str, Any]],
+    raw_subtitles: Optional[List[Dict[str, Any]]] = None,
+) -> int:
     count = 0
     sentence_info = item.get("sentence_info") or []
     for sentence in sentence_info:
@@ -467,23 +588,28 @@ def _parse_funasr_result_item(item: Dict[str, Any], subtitles: List[Dict[str, An
         text = sentence.get("text") or sentence.get("sentence") or ""
         start = _coerce_seconds(sentence.get("start", 0.0))
         end = _coerce_seconds(sentence.get("end", start))
-        _append_subtitle_line(subtitles, text, start, end)
-        count += 1
+        if raw_subtitles is not None:
+            _append_raw_subtitle_line(raw_subtitles, text, start, end)
+        count += _append_split_subtitle_lines(subtitles, text, start, end)
     if count:
         return count
 
     timestamp_pairs = item.get("timestamp") or []
-    text = (item.get("text") or "").strip()
+    text = item.get("text") or item.get("sentence") or ""
     if timestamp_pairs and text:
         try:
             start = _coerce_seconds(timestamp_pairs[0][0])
             end = _coerce_seconds(timestamp_pairs[-1][1])
+            if raw_subtitles is not None:
+                _append_raw_subtitle_line(raw_subtitles, text, start, end)
             return _append_split_subtitle_lines(subtitles, text, start, end)
         except Exception:
             pass
 
     if text:
         start, end = _extract_item_time_range(item)
+        if raw_subtitles is not None:
+            _append_raw_subtitle_line(raw_subtitles, text, start, end)
         return _append_split_subtitle_lines(subtitles, text, start, end)
     return 0
 
@@ -491,19 +617,92 @@ def _parse_funasr_result_item(item: Dict[str, Any], subtitles: List[Dict[str, An
 def _merge_overlapping_subtitles(subtitles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not subtitles:
         return []
-    ordered = sorted(subtitles, key=lambda x: (float(x.get("start_time", 0.0) or 0.0), float(x.get("end_time", 0.0) or 0.0)))
+    ordered = sorted(
+        subtitles,
+        key=lambda x: (
+            float(x.get("start_time", 0.0) or 0.0),
+            float(x.get("end_time", 0.0) or 0.0),
+        ),
+    )
     merged: List[Dict[str, Any]] = []
     for item in ordered:
-        text = (item.get("msg") or "").strip()
-        if not text:
+        text = _clean_subtitle_text(item.get("msg") or "")
+        if not _is_meaningful_subtitle_text(text):
             continue
         start = max(0.0, float(item.get("start_time", 0.0) or 0.0))
         end = max(start, float(item.get("end_time", start) or start))
-        if merged and text == merged[-1].get("msg") and abs(start - float(merged[-1].get("start_time", 0.0))) < 0.01:
-            merged[-1]["end_time"] = max(float(merged[-1].get("end_time", start)), end)
-            continue
+
+        if merged:
+            prev = merged[-1]
+            prev_text = str(prev.get("msg") or "")
+            prev_end = float(prev.get("end_time", 0.0) or 0.0)
+
+            if text == prev_text and abs(start - float(prev.get("start_time", 0.0) or 0.0)) < 0.01:
+                prev["end_time"] = max(prev_end, end)
+                continue
+
+            if start <= prev_end + 0.12 and (len(text) <= 4 or len(prev_text) <= 4):
+                joined = _clean_subtitle_text(prev_text + text)
+                if _is_meaningful_subtitle_text(joined):
+                    prev["msg"] = joined
+                    prev["end_time"] = max(prev_end, end)
+                    continue
+
         merged.append({"msg": text, "start_time": start, "end_time": end})
     return merged
+
+
+def _subtitles_to_srt(subtitles: List[Dict[str, Any]]) -> str:
+    idx = 1
+    lines: List[str] = []
+    for subtitle in subtitles:
+        text = subtitle.get("msg")
+        if text:
+            lines.append(
+                utils.text_to_srt(
+                    idx,
+                    text,
+                    subtitle.get("start_time"),
+                    subtitle.get("end_time"),
+                )
+            )
+            idx += 1
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _write_text_file(path: str, content: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _build_segments_payload(
+    subtitles: List[Dict[str, Any]],
+    *,
+    source: str,
+    backend: str,
+) -> List[Dict[str, Any]]:
+    payload = []
+    for idx, item in enumerate(subtitles, start=1):
+        payload.append(
+            {
+                "id": idx,
+                "start": float(item.get("start_time", 0.0) or 0.0),
+                "end": float(item.get("end_time", 0.0) or 0.0),
+                "text": str(item.get("msg") or ""),
+                "source": source,
+                "backend": backend,
+                "confidence": None,
+            }
+        )
+    return payload
+
+
+def _write_segments_json(path: str, subtitles: List[Dict[str, Any]], *, source: str, backend: str):
+    payload = _build_segments_payload(subtitles, source=source, backend=backend)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def _create_with_sensevoice(audio_file: str, subtitle_file: str = ""):
@@ -513,6 +712,9 @@ def _create_with_sensevoice(audio_file: str, subtitle_file: str = ""):
     logger.info(f"start, output file: {subtitle_file}")
     if not subtitle_file:
         subtitle_file = f"{audio_file}.srt"
+
+    raw_srt_path, clean_srt_path = _derive_debug_paths(subtitle_file)
+    segments_json_path = _derive_segments_json_path(subtitle_file)
 
     forced_language = _normalize_language_code(DEFAULT_FORCE_LANGUAGE) or "zh"
     logger.info(
@@ -544,38 +746,52 @@ def _create_with_sensevoice(audio_file: str, subtitle_file: str = ""):
             merge_vad=True,
             merge_length_s=DEFAULT_FUNASR_MERGE_LENGTH_S,
         )
+
     subtitles: List[Dict[str, Any]] = []
+    raw_subtitles: List[Dict[str, Any]] = []
     raw_items = 0
+
     if isinstance(results, dict):
         results = [results]
+
+    logger.info(f"SenseVoice raw result sample: {str(results)[:1200]}")
+
     for item in results or []:
         if not isinstance(item, dict):
             continue
         raw_items += 1
-        _parse_funasr_result_item(item, subtitles)
+        _parse_funasr_result_item(item, subtitles, raw_subtitles)
 
+    raw_subtitles = _merge_overlapping_subtitles(raw_subtitles)
     subtitles = _merge_overlapping_subtitles(subtitles)
 
     end = timer()
     logger.info(
-        f"SenseVoice-Small complete, elapsed: {end - start:.2f} s, raw_items={raw_items}, subtitle_lines={len(subtitles)}"
+        f"SenseVoice-Small complete, elapsed: {end - start:.2f} s, "
+        f"raw_items={raw_items}, raw_lines={len(raw_subtitles)}, clean_lines={len(subtitles)}"
     )
     if not subtitles:
         logger.error("SenseVoice-Small 未生成有效字幕行")
         return None
 
-    idx = 1
-    lines = []
-    for subtitle in subtitles:
-        text = subtitle.get("msg")
-        if text:
-            lines.append(utils.text_to_srt(idx, text, subtitle.get("start_time"), subtitle.get("end_time")))
-            idx += 1
+    logger.warning(
+        f"SUBTITLE_CLEAN_WRITE count={len(subtitles)} "
+        f"first3={[x.get('msg') for x in subtitles[:3]]}"
+    )
 
-    sub = "\n".join(lines) + "\n"
-    with open(subtitle_file, "w", encoding="utf-8") as f:
-        f.write(sub)
+    raw_srt = _subtitles_to_srt(raw_subtitles)
+    clean_srt = _subtitles_to_srt(subtitles)
+
+    _write_text_file(raw_srt_path, raw_srt)
+    _write_text_file(clean_srt_path, clean_srt)
+    _write_text_file(subtitle_file, clean_srt)
+    _write_segments_json(segments_json_path, subtitles, source="auto_clean", backend="sensevoice")
+
+    logger.info(f"raw subtitle file created: {raw_srt_path}")
+    logger.info(f"clean subtitle file created: {clean_srt_path}")
     logger.info(f"subtitle file created: {subtitle_file}")
+    logger.info(f"segments json created: {segments_json_path}")
+
     return subtitle_file if os.path.exists(subtitle_file) else None
 
 
@@ -587,6 +803,9 @@ def _create_with_faster_whisper(audio_file: str, subtitle_file: str = ""):
     logger.info(f"start, output file: {subtitle_file}")
     if not subtitle_file:
         subtitle_file = f"{audio_file}.srt"
+
+    raw_srt_path, clean_srt_path = _derive_debug_paths(subtitle_file)
+    segments_json_path = _derive_segments_json_path(subtitle_file)
 
     forced_language = _normalize_language_code(DEFAULT_FORCE_LANGUAGE)
     transcribe_kwargs = dict(
@@ -616,30 +835,44 @@ def _create_with_faster_whisper(audio_file: str, subtitle_file: str = ""):
     logger.info(f"检测到的语言: '{info.language}', probability: {info.language_probability:.2f}")
 
     start = timer()
-    subtitles = []
+    subtitles: List[Dict[str, Any]] = []
+    raw_subtitles: List[Dict[str, Any]] = []
     segment_count = 0
+
     for segment in segments:
         segment_count += 1
-        text = (getattr(segment, "text", "") or "").strip()
-        if not text:
+        raw_text = getattr(segment, "text", "") or ""
+        seg_start = float(getattr(segment, "start", 0.0) or 0.0)
+        seg_end = float(getattr(segment, "end", 0.0) or 0.0)
+        if not raw_text:
             continue
-        _append_subtitle_line(subtitles, text, float(getattr(segment, "start", 0.0) or 0.0), float(getattr(segment, "end", 0.0) or 0.0))
+        _append_raw_subtitle_line(raw_subtitles, raw_text, seg_start, seg_end)
+        _append_split_subtitle_lines(subtitles, raw_text, seg_start, seg_end)
+
+    raw_subtitles = _merge_overlapping_subtitles(raw_subtitles)
+    subtitles = _merge_overlapping_subtitles(subtitles)
 
     end = timer()
-    logger.info(f"complete, elapsed: {end - start:.2f} s, raw_segments={segment_count}, subtitle_lines={len(subtitles)}")
+    logger.info(
+        f"complete, elapsed: {end - start:.2f} s, raw_segments={segment_count}, "
+        f"raw_lines={len(raw_subtitles)}, clean_lines={len(subtitles)}"
+    )
+    if not subtitles:
+        logger.error("faster-whisper 未生成有效字幕行")
+        return None
 
-    idx = 1
-    lines = []
-    for subtitle in subtitles:
-        text = subtitle.get("msg")
-        if text:
-            lines.append(utils.text_to_srt(idx, text, subtitle.get("start_time"), subtitle.get("end_time")))
-            idx += 1
+    raw_srt = _subtitles_to_srt(raw_subtitles)
+    clean_srt = _subtitles_to_srt(subtitles)
 
-    sub = "\n".join(lines) + "\n"
-    with open(subtitle_file, "w", encoding="utf-8") as f:
-        f.write(sub)
+    _write_text_file(raw_srt_path, raw_srt)
+    _write_text_file(clean_srt_path, clean_srt)
+    _write_text_file(subtitle_file, clean_srt)
+    _write_segments_json(segments_json_path, subtitles, source="auto_clean", backend="faster-whisper")
+
+    logger.info(f"raw subtitle file created: {raw_srt_path}")
+    logger.info(f"clean subtitle file created: {clean_srt_path}")
     logger.info(f"subtitle file created: {subtitle_file}")
+    logger.info(f"segments json created: {segments_json_path}")
     return subtitle_file if os.path.exists(subtitle_file) else None
 
 
@@ -694,7 +927,7 @@ def levenshtein_distance(s1, s2):
 def similarity(a, b):
     distance = levenshtein_distance(a.lower(), b.lower())
     max_length = max(len(a), len(b))
-    return 1 - (distance / max_length)
+    return 1 - (distance / max_length) if max_length else 1.0
 
 
 def correct(subtitle_file, video_script):
@@ -724,7 +957,6 @@ def create_with_gemini(audio_file: str, subtitle_file: str, api_key: str):
 
 
 def extract_audio_and_create_subtitle(video_file: str, subtitle_file: str = "") -> Optional[str]:
-    """从视频文件中提取音频并生成字幕文件。"""
     audio_file = ""
     video = None
     try:

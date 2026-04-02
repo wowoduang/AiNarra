@@ -24,7 +24,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # 复制 requirements.txt 并使用镜像安装 Python 依赖
 COPY requirements.txt .
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir --default-timeout=120 \
+    -i https://pypi.org/simple \
+    -r requirements.txt
 
 # 运行阶段
 FROM python:3.12-slim-bookworm
